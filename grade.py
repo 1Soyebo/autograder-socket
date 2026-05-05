@@ -30,6 +30,7 @@ Example:
 """
 
 import argparse
+import datetime
 import hashlib
 import queue
 import re
@@ -123,6 +124,31 @@ def contains_any(text: str, keywords: list) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Stdout tee -- writes to both the terminal and a log file simultaneously
+# ---------------------------------------------------------------------------
+
+class _Tee:
+    """Wraps a stream so that writes go to both *stream* and *log_file*."""
+
+    def __init__(self, stream, log_file):
+        self._stream   = stream
+        self._log_file = log_file
+
+    def write(self, data):
+        self._stream.write(data)
+        self._log_file.write(data)
+
+    def flush(self):
+        self._stream.flush()
+        self._log_file.flush()
+
+    # Proxy all other attribute access to the underlying stream so that
+    # anything that checks sys.stdout.encoding, isatty(), etc. still works.
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+
+# ---------------------------------------------------------------------------
 # Dummy reader for missing servers
 # ---------------------------------------------------------------------------
 
@@ -147,6 +173,11 @@ class Grader:
         self.deductions = 0
         self.feedback: list = []
         self._procs: list = []
+
+        # Log file: <submission_dir_name>_<YYYYMMDD_HHMMSS>.txt  (next to grade.py)
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        safe_name = re.sub(r"[^\w\-]", "_", self.submission_dir.name)
+        self.log_path = Path(__file__).with_name(f"{safe_name}_{timestamp}.txt")
 
         n = int(self.usc_suffix)
         self.auth_udp_port  = 21000 + n
@@ -1123,6 +1154,16 @@ class Grader:
     # ------------------------------------------------------------------
 
     def run(self) -> int:
+        log_file = open(self.log_path, "w", encoding="utf-8")
+        original_stdout = sys.stdout
+        sys.stdout = _Tee(original_stdout, log_file)
+        try:
+            return self._run_grading()
+        finally:
+            sys.stdout = original_stdout
+            log_file.close()
+
+    def _run_grading(self) -> int:
         print(f"\n{'#'*62}")
         print(f"  EE450 Socket Programming Autograder -- Spring 2026")
         print(f"  Submission : {self.submission_dir}")
@@ -1185,6 +1226,8 @@ class Grader:
         if self.deductions:
             print(f"  Deductions   : -{self.deductions}")
         print(f"  FINAL SCORE  : {net} / 100")
+        print(f"{'='*62}")
+        print(f"  Log saved to : {self.log_path}")
         print(f"{'='*62}\n")
         return net
 
