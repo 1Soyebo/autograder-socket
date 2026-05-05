@@ -2,29 +2,37 @@
 """
 EE450 Socket Programming Project Autograder (Spring 2026)
 
+Scoring follows "EE 450 Testing Criteria.pdf":
+  Phase A1  Boot-up (4 servers)           40 pts  (10 each)
+  Phase 1B  Authentication (3 cases)      10 pts  (4+3+3)
+  Phase 2   lookup                         2 pts
+  Phase 2   lookup <doctor> (3 cases)      8 pts  (3+3+2)
+  Phase 2   schedule (4 cases)            10 pts  (3+2+2+3)
+  Phase 2   view_appointment (2 cases)     6 pts  (3+3)
+  Phase 2   view_appointments (2 cases)    6 pts  (3+3)
+  Phase 2   cancel (2 cases)               4 pts  (2+2)
+  Phase 3   prescribe                      4 pts
+  Phase 3   view_prescription patient (3)  6 pts  (2+2+2)
+  Phase 3   view_prescription doctor (2)   4 pts  (2+2)
+  -------------------------------------------------------
+  TOTAL (before deductions)              100 pts
+
+Deductions:
+  -3 each : wrong / hardcoded static port numbers
+  -3      : cancel removes the timeslot line from appointments.txt
+  -1      : prescribe does not free the appointment slot
+
 Usage:
     python3 grade.py <submission_dir> --usc-id <last_3_digits> [--verbose]
 
 Example:
     python3 grade.py ./ee450_Doe_John --usc-id 319 --verbose
-
-The script:
-  1. Checks required files (source files, Makefile, README)
-  2. Compiles with `make all`
-  3. Creates test data files (users.txt, hospital.txt, appointments.txt, prescriptions.txt)
-  4. Starts servers in required order and checks boot-up messages
-  5. Runs client sessions testing Phase 1B, Phase 2, and Phase 3
-  6. Grades each phase against expected on-screen messages
-  7. Prints a final score breakdown
 """
 
 import argparse
 import hashlib
-import os
 import queue
 import re
-import shutil
-import signal
 import subprocess
 import sys
 import threading
@@ -33,16 +41,16 @@ from pathlib import Path
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# SHA-256 utilities
 # ---------------------------------------------------------------------------
 
 def sha256_hash(text: str) -> str:
-    """SHA-256 hex digest of text (stripped), matching the project spec."""
+    """SHA-256 hex digest (strips whitespace), matching the project spec."""
     return hashlib.sha256(text.strip().encode("utf-8")).hexdigest()
 
 
 def hash_suffix(text: str) -> str:
-    """Last 5 hex characters of the SHA-256 hash (the 'hash_suffix' per spec)."""
+    """Last 5 hex chars of the SHA-256 hash -- the hash_suffix per spec."""
     return sha256_hash(text)[-5:]
 
 
@@ -51,51 +59,48 @@ def hash_suffix(text: str) -> str:
 # ---------------------------------------------------------------------------
 
 class OutputReader:
-    """Reads stdout of a subprocess in a background thread into a queue."""
+    """Reads stdout of a subprocess in a background thread."""
 
     def __init__(self, proc: subprocess.Popen, name: str):
         self.proc = proc
         self.name = name
         self._q: queue.Queue = queue.Queue()
         self._lines: list = []
+        self._lock = threading.Lock()
         self._thread = threading.Thread(target=self._reader, daemon=True)
         self._thread.start()
 
     def _reader(self):
         for line in self.proc.stdout:
+            with self._lock:
+                self._lines.append(line)
             self._q.put(line)
-            self._lines.append(line)
 
-    def get_lines(self, timeout: float = 0.0) -> list:
-        """Drain newly-arrived lines within `timeout` seconds."""
-        deadline = time.time() + timeout
-        new_lines = []
-        while True:
-            remaining = deadline - time.time()
-            try:
-                line = self._q.get(timeout=max(remaining, 0.01))
-                new_lines.append(line)
-            except queue.Empty:
-                break
-        return new_lines
+    def snapshot(self) -> int:
+        """Return current line count -- use as a before marker."""
+        with self._lock:
+            return len(self._lines)
+
+    def new_output(self, since: int) -> str:
+        """Return all output collected after position since."""
+        with self._lock:
+            return "".join(self._lines[since:])
 
     def all_output(self) -> str:
-        """Return all output collected so far."""
-        return "".join(self._lines)
+        with self._lock:
+            return "".join(self._lines)
 
-    def wait_for(self, pattern: str, timeout: float = 5.0) -> bool:
-        """Block until *pattern* appears in output or timeout expires."""
-        deadline = time.time() + timeout
-        compiled = re.compile(re.escape(pattern))
-        # First check already-collected lines
-        if compiled.search(self.all_output()):
+    def wait_for(self, pattern: str, timeout: float = 8.0) -> bool:
+        """Block until pattern (case-insensitive) appears or timeout expires."""
+        pat = re.compile(re.escape(pattern), re.IGNORECASE)
+        if pat.search(self.all_output()):
             return True
+        deadline = time.time() + timeout
         while time.time() < deadline:
             remaining = deadline - time.time()
             try:
                 line = self._q.get(timeout=min(remaining, 0.2))
-                self._lines.append(line)
-                if compiled.search(line):
+                if pat.search(line):
                     return True
             except queue.Empty:
                 pass
@@ -103,61 +108,74 @@ class OutputReader:
 
 
 # ---------------------------------------------------------------------------
-# Grader
+# Lenient message checkers
+# ---------------------------------------------------------------------------
+
+def contains_all(text: str, keywords: list) -> bool:
+    """Return True if text contains every keyword (case-insensitive)."""
+    lower = text.lower()
+    return all(kw.lower() in lower for kw in keywords)
+
+
+def contains_any(text: str, keywords: list) -> bool:
+    lower = text.lower()
+    return any(kw.lower() in lower for kw in keywords)
+
+
+# ---------------------------------------------------------------------------
+# Dummy reader for missing servers
+# ---------------------------------------------------------------------------
+
+class _DummyReader:
+    def all_output(self):          return ""
+    def snapshot(self):            return 0
+    def new_output(self, since):   return ""
+
+
+# ---------------------------------------------------------------------------
+# Main Grader
 # ---------------------------------------------------------------------------
 
 class Grader:
 
-    # Grading weights
-    WEIGHTS = {
-        "files":    5,   # required files present
-        "compile":  10,  # make all succeeds
-        "phase1a":  10,  # boot-up messages
-        "phase1b":  20,  # authentication
-        "phase2":   30,  # patient + doctor Phase-2 commands
-        "phase3":   25,  # prescription Phase-3 commands
-    }
-
     def __init__(self, submission_dir: str, usc_suffix: str, verbose: bool = False):
         self.submission_dir = Path(submission_dir).resolve()
-        # Accept 1-3 digit suffix; zero-pad to 3 digits
         self.usc_suffix = usc_suffix.strip().zfill(3)[-3:]
         self.verbose = verbose
 
         self.score = 0
+        self.deductions = 0
         self.feedback: list = []
-        self._procs: list = []        # all started subprocesses
+        self._procs: list = []
 
-        # Ports derived from USC ID suffix
         n = int(self.usc_suffix)
-        self.auth_udp_port   = 21000 + n
-        self.presc_udp_port  = 22000 + n
-        self.appt_udp_port   = 23000 + n
-        self.hosp_udp_port   = 25000 + n
-        self.hosp_tcp_port   = 26000 + n
+        self.auth_udp_port  = 21000 + n
+        self.presc_udp_port = 22000 + n
+        self.appt_udp_port  = 23000 + n
+        self.hosp_udp_port  = 25000 + n
+        self.hosp_tcp_port  = 26000 + n
 
         # Test credentials
-        self.doctor_name   = "alice"
-        self.doctor_pass   = "doc123"
-        self.patient_name  = "bob"
-        self.patient_pass  = "pat456"
-        self.bad_user      = "nobody"
-        self.bad_pass      = "wrong"
+        self.doctor_name  = "alice"
+        self.doctor_pass  = "doc123"
+        self.patient_name = "bob"
+        self.patient_pass = "pat456"
+        self.bad_user     = "nobody"
+        self.bad_pass     = "wrong"
 
-        # Pre-compute hashes
-        self.doctor_hash         = sha256_hash(self.doctor_name)
-        self.doctor_hash_suffix  = hash_suffix(self.doctor_name)
-        self.patient_hash        = sha256_hash(self.patient_name)
-        self.patient_hash_suffix = hash_suffix(self.patient_name)
+        self.doctor_hs  = hash_suffix(self.doctor_name)
+        self.patient_hs = hash_suffix(self.patient_name)
+        self.bad_hs     = hash_suffix(self.bad_user)
 
-        # Appointment test data
-        self.test_doctor    = self.doctor_name
         self.test_time      = "09:00"
         self.test_illness   = "flu"
         self.test_treatment = "Tamiflu"
 
+        # Populated by check_phase1a
+        self.readers: dict = {}
+
     # ------------------------------------------------------------------
-    # Internal helpers
+    # Logging / recording
     # ------------------------------------------------------------------
 
     def _log(self, msg: str):
@@ -166,11 +184,11 @@ class Grader:
 
     def _record(self, label: str, earned: int, possible: int):
         if possible == 0:
-            icon = "ℹ"
+            icon = "\u2139"
         elif earned == possible:
-            icon = "✓"
+            icon = "\u2713"
         elif earned == 0:
-            icon = "✗"
+            icon = "\u2717"
         else:
             icon = "~"
         line = f"  {icon} {label}: {earned}/{possible}"
@@ -178,19 +196,26 @@ class Grader:
         self.score += earned
         print(line)
 
+    def _deduct(self, label: str, amount: int):
+        line = f"  \u26a0 DEDUCTION -- {label}: -{amount}"
+        self.feedback.append(line)
+        self.deductions += amount
+        print(line)
+
     def _section(self, title: str):
-        print(f"\n{'='*60}")
+        print(f"\n{'='*62}")
         print(f"  {title}")
-        print(f"{'='*60}")
+        print(f"{'='*62}")
+
+    # ------------------------------------------------------------------
+    # Process helpers
+    # ------------------------------------------------------------------
 
     def _find_executable(self, name: str) -> list:
-        """Return a command list to run the named component."""
         for ext in ("", ".py"):
             p = self.submission_dir / (name + ext)
             if p.exists():
-                if ext == ".py":
-                    return ["python3", str(p)]
-                return [str(p)]
+                return (["python3", str(p)] if ext == ".py" else [str(p)])
         return []
 
     def _start_process(self, cmd: list, name: str) -> subprocess.Popen:
@@ -220,18 +245,14 @@ class Grader:
         self._procs.clear()
 
     # ------------------------------------------------------------------
-    # Test data creation
+    # Test data
     # ------------------------------------------------------------------
 
     def _create_test_data(self):
-        """Write the four data files the servers read on start-up."""
-
-        # users.txt  (authentication_server)
         with open(self.submission_dir / "users.txt", "w") as f:
             f.write(f"{sha256_hash(self.doctor_name)} {sha256_hash(self.doctor_pass)}\n")
             f.write(f"{sha256_hash(self.patient_name)} {sha256_hash(self.patient_pass)}\n")
 
-        # hospital.txt  (hospital_server)
         with open(self.submission_dir / "hospital.txt", "w") as f:
             f.write("[Doctors]\n")
             f.write(f"{self.doctor_name} {sha256_hash(self.doctor_name)}\n")
@@ -240,98 +261,177 @@ class Grader:
             f.write("cold Rest\n")
             f.write("headache Aspirin\n")
 
-        # appointments.txt  (appointment_server)
+        self._reset_appointments()
+        self._reset_prescriptions()
+        self._log("Test data files created")
+
+    def _reset_appointments(self):
         with open(self.submission_dir / "appointments.txt", "w") as f:
             f.write(f"{self.doctor_name}\n")
             for hour in range(9, 17):
                 f.write(f"{hour:02d}:00\n")
+        time.sleep(0.2)
 
-        # prescriptions.txt  (prescription_server) – start empty
+    def _reset_prescriptions(self):
         with open(self.submission_dir / "prescriptions.txt", "w") as f:
             f.write("")
+        time.sleep(0.2)
 
-        self._log("Test data files created")
+    def _fill_all_appointments(self):
+        """Fill all 8 time slots with dummy patients so the doctor is fully booked."""
+        with open(self.submission_dir / "appointments.txt", "w") as f:
+            f.write(f"{self.doctor_name}\n")
+            for i, hour in enumerate(range(9, 17)):
+                dummy = sha256_hash(f"dummy{i}")
+                f.write(f"{hour:02d}:00 {dummy} cold\n")
+        time.sleep(0.2)
+
+    def _partially_fill_appointments(self):
+        """Fill even-indexed slots, leave odd slots free."""
+        with open(self.submission_dir / "appointments.txt", "w") as f:
+            f.write(f"{self.doctor_name}\n")
+            for i, hour in enumerate(range(9, 17)):
+                if i % 2 == 0:
+                    dummy = sha256_hash(f"dummy{i}")
+                    f.write(f"{hour:02d}:00 {dummy} cold\n")
+                else:
+                    f.write(f"{hour:02d}:00\n")
+        time.sleep(0.2)
 
     # ------------------------------------------------------------------
-    # Phase checks
+    # Client session runner
+    # ------------------------------------------------------------------
+
+    def _snapshots(self) -> dict:
+        return {name: r.snapshot() for name, r in self.readers.items()}
+
+    def _new_server_output(self, snaps: dict) -> dict:
+        return {name: self.readers[name].new_output(snaps[name])
+                for name in self.readers}
+
+    def _run_client_session(
+        self,
+        args: list,
+        commands: list,
+        cmd_wait: float = 2.5,
+        auth_wait: float = 1.5,
+    ) -> tuple:
+        """
+        Run client with args, send commands, return (client_output, server_outputs_dict).
+        """
+        snaps = self._snapshots()
+        cmd = self._find_executable("client")
+        if not cmd:
+            return "", {name: "" for name in self.readers}
+
+        proc = self._start_process(cmd + list(args), "client")
+        reader = OutputReader(proc, "client")
+        time.sleep(auth_wait)
+
+        for command in commands:
+            self._log(f"  -> cmd: {command!r}")
+            try:
+                proc.stdin.write(command + "\n")
+                proc.stdin.flush()
+            except BrokenPipeError:
+                break
+            time.sleep(cmd_wait)
+
+        try:
+            proc.stdin.write("quit\n")
+            proc.stdin.flush()
+        except BrokenPipeError:
+            pass
+        time.sleep(0.5)
+        try:
+            proc.terminate()
+            proc.wait(timeout=3)
+        except Exception:
+            pass
+
+        client_out = reader.all_output()
+        server_outs = self._new_server_output(snaps)
+        self._log(f"Client output:\n{client_out}")
+        for sname, sout in server_outs.items():
+            self._log(f"{sname} output:\n{sout}")
+        return client_out, server_outs
+
+    # ------------------------------------------------------------------
+    # Phase 0 -- files + compile
     # ------------------------------------------------------------------
 
     def check_files(self) -> int:
-        self._section("Phase 0 – Required Files")
-        max_pts = self.WEIGHTS["files"]
+        self._section("Phase 0 -- Required Files")
 
         components = {
-            "client":                ["client.c", "client.cc", "client.cpp", "client.py"],
-            "hospital_server":       ["hospital_server.c", "hospital_server.cc",
-                                      "hospital_server.cpp", "hospital_server.py"],
-            "authentication_server": ["authentication_server.c", "authentication_server.cc",
-                                      "authentication_server.cpp", "authentication_server.py"],
-            "appointment_server":    ["appointment_server.c", "appointment_server.cc",
-                                      "appointment_server.cpp", "appointment_server.py"],
-            "prescription_server":   ["prescription_server.c", "prescription_server.cc",
-                                      "prescription_server.cpp", "prescription_server.py"],
+            "client":                ["client.c","client.cc","client.cpp","client.py"],
+            "hospital_server":       ["hospital_server.c","hospital_server.cc",
+                                      "hospital_server.cpp","hospital_server.py"],
+            "authentication_server": ["authentication_server.c","authentication_server.cc",
+                                      "authentication_server.cpp","authentication_server.py"],
+            "appointment_server":    ["appointment_server.c","appointment_server.cc",
+                                      "appointment_server.cpp","appointment_server.py"],
+            "prescription_server":   ["prescription_server.c","prescription_server.cc",
+                                      "prescription_server.cpp","prescription_server.py"],
         }
 
         makefile_ok = (self.submission_dir / "Makefile").exists()
         readme_ok = any(
             (self.submission_dir / r).exists()
-            for r in ["README", "README.md", "readme.txt", "readme.md", "README.txt"]
+            for r in ["README","README.md","readme.txt","readme.md","README.txt"]
         )
 
-        if not makefile_ok:
-            self._record("Makefile present (REQUIRED – will not grade without it)", 0, 0)
-            return 0
-        if not readme_ok:
-            self._record("README present (REQUIRED – will not grade without it)", 0, 0)
+        if not makefile_ok or not readme_ok:
+            missing = []
+            if not makefile_ok: missing.append("Makefile")
+            if not readme_ok:   missing.append("README")
+            self._record(
+                f"Required files (MISSING: {', '.join(missing)}) -- WILL NOT GRADE", 0, 0
+            )
             return 0
 
-        missing = [
-            comp for comp, variants in components.items()
+        missing_src = [
+            c for c, variants in components.items()
             if not any((self.submission_dir / v).exists() for v in variants)
         ]
-
-        if missing:
-            self._record(f"Source files present (missing: {', '.join(missing)})", 0, max_pts)
+        if missing_src:
+            self._record(f"Source files (missing: {', '.join(missing_src)})", 0, 5)
             return 0
 
-        self._record("All required files present (Makefile, README, source files)", max_pts, max_pts)
-        return max_pts
+        self._record("All required files present (Makefile, README, source files)", 5, 5)
+        return 5
 
     def check_compile(self) -> int:
-        self._section("Phase 0 – Compilation")
-        max_pts = self.WEIGHTS["compile"]
-
+        self._section("Phase 0 -- Compilation (make all)")
         try:
             result = subprocess.run(
                 ["make", "all"],
                 cwd=str(self.submission_dir),
-                capture_output=True,
-                text=True,
-                timeout=120,
+                capture_output=True, text=True, timeout=120,
             )
         except subprocess.TimeoutExpired:
-            self._record("make all (timed out after 120s)", 0, max_pts)
+            self._record("make all (timed out)", 0, 10)
             return 0
         except FileNotFoundError:
-            self._record("make all (make not found)", 0, max_pts)
+            self._record("make all (make not found)", 0, 10)
             return 0
 
         if result.returncode == 0:
-            self._record("make all succeeded", max_pts, max_pts)
-            return max_pts
+            self._record("make all succeeded", 10, 10)
+            return 10
         else:
             if self.verbose:
-                print(f"\n  Compiler output (last 20 lines):")
-                for line in result.stderr.strip().splitlines()[-20:]:
+                for line in (result.stderr or result.stdout).splitlines()[-20:]:
                     print(f"    {line}")
-            self._record("make all failed – receiving 5/100 total per spec", 0, max_pts)
+            self._record("make all FAILED -- 5/100 cap per spec", 0, 10)
             return 0
 
+    # ------------------------------------------------------------------
+    # Phase A1 -- Boot-up (40 pts, 10 each)
+    # ------------------------------------------------------------------
+
     def check_phase1a(self) -> int:
-        """Boot-up messages for all four servers."""
-        self._section("Phase 1A – Server Boot-Up Messages")
-        max_pts = self.WEIGHTS["phase1a"]
-        pts_per_server = max_pts // 4  # 2 pts each
+        self._section("Phase A1 -- Server Boot-Up Messages [40 pts]")
         total = 0
 
         boot_specs = [
@@ -345,416 +445,764 @@ class Grader:
              f"Prescription Server is up and running using UDP on port {self.presc_udp_port}"),
         ]
 
-        self._readers = {}  # name -> OutputReader
+        self.readers = {}
 
-        # Start servers in spec-required order
-        for name, expected_msg in boot_specs:
+        for name, expected in boot_specs:
             cmd = self._find_executable(name)
             if not cmd:
-                self._record(f"{name} boot-up message", 0, pts_per_server)
+                self._record(f"{name} boot-up", 0, 10)
                 continue
-
             proc = self._start_process(cmd, name)
             reader = OutputReader(proc, name)
-            self._readers[name] = reader
+            self.readers[name] = reader
 
-            found = reader.wait_for(expected_msg, timeout=8.0)
+            found = reader.wait_for(expected, timeout=8.0)
             self._log(f"{name} boot output:\n{reader.all_output()}")
-
             if found:
-                self._record(f"{name} boot-up message", pts_per_server, pts_per_server)
-                total += pts_per_server
+                self._record(f"{name} boot-up message", 10, 10)
+                total += 10
             else:
                 self._record(
-                    f"{name} boot-up message (expected: \"{expected_msg}\")", 0, pts_per_server
+                    f"{name} boot-up message (expected: \"{expected}\")", 0, 10
                 )
 
-        # Give servers a moment to fully initialize
         time.sleep(1.0)
         return total
 
-    def _run_client_session(self, args: list, commands: list, timeout_per_cmd: float = 3.0) -> str:
-        """
-        Start the client with `args` (e.g. [username, password]),
-        send each command, collect all output, then quit.
-        Returns the full combined stdout of the client session.
-        """
-        cmd = self._find_executable("client")
-        if not cmd:
-            return ""
-        full_cmd = cmd + list(args)
-        proc = self._start_process(full_cmd, "client")
-        reader = OutputReader(proc, "client")
-        time.sleep(1.5)  # wait for auth to complete
+    # ------------------------------------------------------------------
+    # Phase 1B -- Authentication (10 pts: patient=4, doctor=3, fail=3)
+    # ------------------------------------------------------------------
 
-        for command in commands:
-            self._log(f"  -> sending: {command!r}")
-            try:
-                proc.stdin.write(command + "\n")
-                proc.stdin.flush()
-            except BrokenPipeError:
-                break
-            time.sleep(timeout_per_cmd)
+    def check_phase1b(self) -> int:
+        self._section("Phase 1B -- Authentication [10 pts]")
+        total = 0
 
-        # Send quit
+        # Sub-case: Patient login success (4 pts)
+        pts = 4
+        c_out, s_outs = self._run_client_session(
+            [self.patient_name, self.patient_pass], []
+        )
+        hosp = s_outs.get("hospital_server", "")
+        auth = s_outs.get("authentication_server", "")
+        client_ok = contains_all(c_out, ["authentication successful", "patient access"])
+        hosp_ok   = contains_all(hosp, ["authentication request", self.patient_hs])
+        auth_ok   = contains_any(auth, ["authentication succeeded", "succeeded"])
+        if client_ok and hosp_ok and auth_ok:
+            earned = pts
+        elif client_ok and hosp_ok:
+            earned = pts - 1
+        elif client_ok:
+            earned = pts - 2
+        else:
+            earned = 0
+        self._record("Patient login success", earned, pts)
+        total += earned
+
+        # Sub-case: Doctor login success (3 pts)
+        pts = 3
+        c_out, s_outs = self._run_client_session(
+            [self.doctor_name, self.doctor_pass], []
+        )
+        hosp = s_outs.get("hospital_server", "")
+        auth = s_outs.get("authentication_server", "")
+        client_ok = contains_all(c_out, ["authentication successful", "doctor access"])
+        hosp_ok   = contains_all(hosp, ["authentication request", self.doctor_hs])
+        auth_ok   = contains_any(auth, ["authentication succeeded", "succeeded"])
+        if client_ok and hosp_ok and auth_ok:
+            earned = pts
+        elif client_ok and hosp_ok:
+            earned = pts - 1
+        elif client_ok:
+            earned = pts - 1
+        else:
+            earned = 0
+        self._record("Doctor login success", earned, pts)
+        total += earned
+
+        # Sub-case: Failed login (3 pts)
+        pts = 3
+        c_out, s_outs = self._run_client_session(
+            [self.bad_user, self.bad_pass], []
+        )
+        auth = s_outs.get("authentication_server", "")
+        hosp = s_outs.get("hospital_server", "")
+        client_ok = contains_any(c_out, ["incorrect", "failed", "invalid", "credentials"])
+        auth_ok   = contains_any(auth, ["authentication failed", "failed"])
+        hosp_ok   = contains_any(hosp, ["authentication request"])
+        if client_ok and auth_ok and hosp_ok:
+            earned = pts
+        elif client_ok and auth_ok:
+            earned = pts - 1
+        elif client_ok:
+            earned = pts - 1
+        else:
+            earned = 0
+        self._record("Failed login (invalid credentials)", earned, pts)
+        total += earned
+
+        return total
+
+    # ------------------------------------------------------------------
+    # Phase 2 -- lookup [2 pts]
+    # ------------------------------------------------------------------
+
+    def check_phase2_lookup(self) -> int:
+        self._section("Phase 2 -- lookup (list doctors) [2 pts]")
+        pts = 2
+        c_out, s_outs = self._run_client_session(
+            [self.patient_name, self.patient_pass], ["lookup"]
+        )
+        hosp = s_outs.get("hospital_server", "")
+        appt = s_outs.get("appointment_server", "")
+        client_ok = self.doctor_name.lower() in c_out.lower()
+        hosp_ok   = contains_any(hosp, ["lookup request", "doctor lookup"])
+        appt_ok   = contains_any(appt, ["availability request", "lookup result"])
+        if client_ok and hosp_ok and appt_ok:
+            earned = pts
+        elif client_ok and hosp_ok:
+            earned = pts - 1
+        elif client_ok:
+            earned = pts - 1
+        else:
+            earned = 0
+        self._record("lookup (list all doctors)", earned, pts)
+        return earned
+
+    # ------------------------------------------------------------------
+    # Phase 2 -- lookup <doctor> [8 pts: 3+3+2]
+    # ------------------------------------------------------------------
+
+    def check_phase2_lookup_doctor(self) -> int:
+        self._section(f"Phase 2 -- lookup <doctor> [8 pts]")
+        total = 0
+
+        # Sub-case: all slots available (3 pts)
+        pts = 3
+        self._reset_appointments()
+        c_out, s_outs = self._run_client_session(
+            [self.patient_name, self.patient_pass], [f"lookup {self.doctor_name}"]
+        )
+        appt = s_outs.get("appointment_server", "")
+        client_ok = contains_any(c_out, ["all time blocks are available", "all time blocks"])
+        appt_ok   = contains_any(appt, ["all time blocks are available", "all time blocks"])
+        if client_ok and appt_ok:
+            earned = pts
+        elif client_ok:
+            earned = pts - 1
+        else:
+            earned = 0
+        self._record(f"lookup {self.doctor_name} -- all slots available", earned, pts)
+        total += earned
+
+        # Sub-case: no slots available (3 pts)
+        pts = 3
+        self._fill_all_appointments()
+        c_out, s_outs = self._run_client_session(
+            [self.patient_name, self.patient_pass], [f"lookup {self.doctor_name}"]
+        )
+        appt = s_outs.get("appointment_server", "")
+        client_ok = contains_any(c_out, ["no time slots available", "no time slots"])
+        appt_ok   = contains_any(appt, ["no time slots available", "no time slots"])
+        if client_ok and appt_ok:
+            earned = pts
+        elif client_ok:
+            earned = pts - 1
+        else:
+            earned = 0
+        self._record(f"lookup {self.doctor_name} -- no slots available", earned, pts)
+        total += earned
+
+        # Sub-case: some slots available (2 pts)
+        pts = 2
+        self._partially_fill_appointments()
+        c_out, s_outs = self._run_client_session(
+            [self.patient_name, self.patient_pass], [f"lookup {self.doctor_name}"]
+        )
+        appt = s_outs.get("appointment_server", "")
+        client_ok = contains_any(c_out, ["available at times", "is available", "10:00", "12:00"])
+        appt_ok   = contains_any(appt, ["some time slots available", "some time slots"])
+        if client_ok and appt_ok:
+            earned = pts
+        elif client_ok:
+            earned = pts - 1
+        else:
+            earned = 0
+        self._record(f"lookup {self.doctor_name} -- some slots available", earned, pts)
+        total += earned
+
+        self._reset_appointments()
+        return total
+
+    # ------------------------------------------------------------------
+    # Phase 2 -- schedule [10 pts: 3+2+2+3]
+    # ------------------------------------------------------------------
+
+    def check_phase2_schedule(self) -> int:
+        self._section("Phase 2 -- schedule [10 pts]")
+        total = 0
+
+        # Sub-case: success (3 pts)
+        pts = 3
+        self._reset_appointments()
+        c_out, s_outs = self._run_client_session(
+            [self.patient_name, self.patient_pass],
+            [f"schedule {self.doctor_name} {self.test_time} {self.test_illness}"]
+        )
+        appt = s_outs.get("appointment_server", "")
+        hosp = s_outs.get("hospital_server", "")
+        client_ok = contains_any(c_out, ["successfully scheduled", "appointment has been"])
+        appt_ok   = contains_any(appt, ["scheduled successfully", "appointment has been scheduled"])
+        hosp_ok   = contains_any(hosp, ["schedule request", "appointment"])
+        if client_ok and appt_ok and hosp_ok:
+            earned = pts
+        elif client_ok and appt_ok:
+            earned = pts - 1
+        elif client_ok:
+            earned = pts - 1
+        else:
+            earned = 0
+        self._record("schedule -- success", earned, pts)
+        total += earned
+        self._reset_appointments()
+
+        # Sub-case: outside valid hours (2 pts)
+        pts = 2
+        outside_time = "18:00"
+        c_out, s_outs = self._run_client_session(
+            [self.patient_name, self.patient_pass],
+            [f"schedule {self.doctor_name} {outside_time} {self.test_illness}"]
+        )
+        appt = s_outs.get("appointment_server", "")
+        client_ok = contains_any(c_out, ["unable", "not available", "cannot"])
+        appt_ok   = contains_any(appt, ["not available", "scheduling request"])
+        if client_ok and appt_ok:
+            earned = pts
+        elif client_ok:
+            earned = pts - 1
+        else:
+            earned = 0
+        self._record("schedule -- outside valid hours (18:00)", earned, pts)
+        total += earned
+
+        # Sub-case: slot already occupied (2 pts)
+        pts = 2
+        self._reset_appointments()
+        self._run_client_session(
+            [self.patient_name, self.patient_pass],
+            [f"schedule {self.doctor_name} {self.test_time} {self.test_illness}"]
+        )
+        c_out, s_outs = self._run_client_session(
+            [self.patient_name, self.patient_pass],
+            [f"schedule {self.doctor_name} {self.test_time} {self.test_illness}"]
+        )
+        appt = s_outs.get("appointment_server", "")
+        client_ok = contains_any(c_out, ["unable", "not available", "cannot"])
+        appt_ok   = contains_any(appt, ["not available", "scheduling request"])
+        if client_ok and appt_ok:
+            earned = pts
+        elif client_ok:
+            earned = pts - 1
+        else:
+            earned = 0
+        self._record("schedule -- slot already occupied", earned, pts)
+        total += earned
+        self._reset_appointments()
+
+        # Sub-case: all slots taken (3 pts)
+        pts = 3
+        self._fill_all_appointments()
+        c_out, s_outs = self._run_client_session(
+            [self.patient_name, self.patient_pass],
+            [f"schedule {self.doctor_name} {self.test_time} {self.test_illness}"]
+        )
+        appt = s_outs.get("appointment_server", "")
+        client_ok = contains_any(c_out, ["all time blocks have been taken", "unable", "no time slots"])
+        appt_ok   = contains_any(appt, ["not available", "scheduling request"])
+        if client_ok and appt_ok:
+            earned = pts
+        elif client_ok:
+            earned = pts - 1
+        else:
+            earned = 0
+        self._record("schedule -- all slots taken", earned, pts)
+        total += earned
+        self._reset_appointments()
+
+        return total
+
+    # ------------------------------------------------------------------
+    # Phase 2 -- view_appointment (patient) [6 pts: 3+3]
+    # ------------------------------------------------------------------
+
+    def check_phase2_view_appointment(self) -> int:
+        self._section("Phase 2 -- view_appointment (patient) [6 pts]")
+        total = 0
+
+        # Sub-case: appointment found (3 pts)
+        pts = 3
+        self._reset_appointments()
+        self._run_client_session(
+            [self.patient_name, self.patient_pass],
+            [f"schedule {self.doctor_name} {self.test_time} {self.test_illness}"]
+        )
+        c_out, s_outs = self._run_client_session(
+            [self.patient_name, self.patient_pass], ["view_appointment"]
+        )
+        appt = s_outs.get("appointment_server", "")
+        hosp = s_outs.get("hospital_server", "")
+        client_ok = contains_any(c_out, [self.doctor_name, self.test_time, "appointment scheduled"])
+        appt_ok   = contains_any(appt, ["view appointment", self.patient_hs])
+        hosp_ok   = contains_any(hosp, ["view appointment"])
+        if client_ok and appt_ok and hosp_ok:
+            earned = pts
+        elif client_ok and appt_ok:
+            earned = pts - 1
+        elif client_ok:
+            earned = pts - 1
+        else:
+            earned = 0
+        self._record("view_appointment -- appointment found", earned, pts)
+        total += earned
+        self._reset_appointments()
+
+        # Sub-case: no appointment (3 pts)
+        pts = 3
+        c_out, s_outs = self._run_client_session(
+            [self.patient_name, self.patient_pass], ["view_appointment"]
+        )
+        appt = s_outs.get("appointment_server", "")
+        client_ok = contains_any(c_out, ["do not have", "no appointment", "you do not"])
+        appt_ok   = contains_any(appt, ["no appointment", "has no appointment"])
+        if client_ok and appt_ok:
+            earned = pts
+        elif client_ok:
+            earned = pts - 1
+        else:
+            earned = 0
+        self._record("view_appointment -- no appointment", earned, pts)
+        total += earned
+
+        return total
+
+    # ------------------------------------------------------------------
+    # Phase 2 -- view_appointments (doctor) [6 pts: 3+3]
+    # ------------------------------------------------------------------
+
+    def check_phase2_view_appointments_doctor(self) -> int:
+        self._section("Phase 2 -- view_appointments (doctor) [6 pts]")
+        total = 0
+
+        # Sub-case: one or more appointments (3 pts)
+        pts = 3
+        self._reset_appointments()
+        self._run_client_session(
+            [self.patient_name, self.patient_pass],
+            [f"schedule {self.doctor_name} {self.test_time} {self.test_illness}"]
+        )
+        c_out, s_outs = self._run_client_session(
+            [self.doctor_name, self.doctor_pass], ["view_appointments"]
+        )
+        appt = s_outs.get("appointment_server", "")
+        hosp = s_outs.get("hospital_server", "")
+        client_ok = contains_any(c_out, [self.test_time, "scheduled at times", "is scheduled"])
+        appt_ok   = contains_any(appt, [self.doctor_name, "view appointments", "scheduled for"])
+        hosp_ok   = contains_any(hosp, ["view appointments", self.doctor_name])
+        if client_ok and appt_ok and hosp_ok:
+            earned = pts
+        elif client_ok and appt_ok:
+            earned = pts - 1
+        elif client_ok:
+            earned = pts - 1
+        else:
+            earned = 0
+        self._record("view_appointments (doctor) -- has appointments", earned, pts)
+        total += earned
+        self._reset_appointments()
+
+        # Sub-case: no appointments (3 pts)
+        pts = 3
+        c_out, s_outs = self._run_client_session(
+            [self.doctor_name, self.doctor_pass], ["view_appointments"]
+        )
+        appt = s_outs.get("appointment_server", "")
+        client_ok = contains_any(c_out, ["do not have any", "no appointments", "you do not"])
+        appt_ok   = contains_any(appt, ["no appointments have been made", "no appointments",
+                                        self.doctor_name])
+        if client_ok and appt_ok:
+            earned = pts
+        elif client_ok:
+            earned = pts - 1
+        else:
+            earned = 0
+        self._record("view_appointments (doctor) -- no appointments", earned, pts)
+        total += earned
+
+        return total
+
+    # ------------------------------------------------------------------
+    # Phase 2 -- cancel [4 pts: 2+2]
+    # ------------------------------------------------------------------
+
+    def check_phase2_cancel(self) -> int:
+        self._section("Phase 2 -- cancel [4 pts]")
+        total = 0
+
+        # Sub-case: successful cancel (2 pts)
+        pts = 2
+        self._reset_appointments()
+        self._run_client_session(
+            [self.patient_name, self.patient_pass],
+            [f"schedule {self.doctor_name} {self.test_time} {self.test_illness}"]
+        )
+        c_out, s_outs = self._run_client_session(
+            [self.patient_name, self.patient_pass], ["cancel"]
+        )
+        appt = s_outs.get("appointment_server", "")
+        hosp = s_outs.get("hospital_server", "")
+        client_ok = contains_any(c_out, ["successfully cancelled", "cancelled your appointment"])
+        appt_ok   = contains_any(appt, ["successfully cancelled", "cancel appointment"])
+        hosp_ok   = contains_any(hosp, ["cancel request", "cancel"])
+        if client_ok and appt_ok and hosp_ok:
+            earned = pts
+        elif client_ok and appt_ok:
+            earned = pts - 1
+        elif client_ok:
+            earned = pts - 1
+        else:
+            earned = 0
+        self._record("cancel -- success", earned, pts)
+        total += earned
+
+        # Deduction: timeslot line must remain after cancel
         try:
-            proc.stdin.write("quit\n")
-            proc.stdin.flush()
-        except BrokenPipeError:
-            pass
-
-        time.sleep(0.5)
-        try:
-            proc.terminate()
-            proc.wait(timeout=3)
+            with open(self.submission_dir / "appointments.txt") as f:
+                content = f.read()
+            if self.test_time not in content:
+                self._deduct("cancel removes timeslot line from appointments.txt", 3)
         except Exception:
             pass
 
-        output = reader.all_output()
-        self._log(f"Client output:\n{output}")
-        return output
-
-    def check_phase1b(self) -> int:
-        """Authentication: valid doctor, valid patient, invalid credentials."""
-        self._section("Phase 1B – Authentication")
-        max_pts = self.WEIGHTS["phase1b"]
-        total = 0
-
-        # --- Sub-test 1: Valid doctor login ---
-        pts = 7
-        out = self._run_client_session(
-            [self.doctor_name, self.doctor_pass], [], timeout_per_cmd=1.0
+        # Sub-case: no appointment to cancel (2 pts)
+        pts = 2
+        self._reset_appointments()
+        c_out, s_outs = self._run_client_session(
+            [self.patient_name, self.patient_pass], ["cancel"]
         )
-        expected_ok  = "Authentication successful"
-        expected_doc = "doctor access"
-        if expected_ok in out and expected_doc in out:
-            self._record(f"Valid doctor login", pts, pts)
-            total += pts
+        appt = s_outs.get("appointment_server", "")
+        client_ok = contains_any(c_out, ["no appointments", "you have no", "failed"])
+        appt_ok   = contains_any(appt, ["failed to find", "error", "cancel appointment"])
+        if client_ok and appt_ok:
+            earned = pts
+        elif client_ok:
+            earned = pts - 1
         else:
-            self._record(
-                f"Valid doctor login (expected auth success + doctor access grant)", 0, pts
-            )
-
-        # --- Sub-test 2: Valid patient login ---
-        pts = 7
-        out = self._run_client_session(
-            [self.patient_name, self.patient_pass], [], timeout_per_cmd=1.0
-        )
-        expected_pat = "patient access"
-        if expected_ok in out and expected_pat in out:
-            self._record("Valid patient login", pts, pts)
-            total += pts
-        else:
-            self._record(
-                "Valid patient login (expected auth success + patient access grant)", 0, pts
-            )
-
-        # --- Sub-test 3: Invalid credentials ---
-        pts = 6
-        out = self._run_client_session(
-            [self.bad_user, self.bad_pass], [], timeout_per_cmd=1.0
-        )
-        if "incorrect" in out.lower() or "failed" in out.lower() or "invalid" in out.lower():
-            self._record("Invalid credentials rejected", pts, pts)
-            total += pts
-        else:
-            self._record(
-                "Invalid credentials rejected (expected failure/incorrect message)", 0, pts
-            )
+            earned = 0
+        self._record("cancel -- no appointment found", earned, pts)
+        total += earned
 
         return total
 
-    def check_phase2(self) -> int:
-        """Phase 2: patient and doctor commands."""
-        self._section("Phase 2 – Patient & Doctor Commands")
-        max_pts = self.WEIGHTS["phase2"]
+    # ------------------------------------------------------------------
+    # Phase 3 -- prescribe (doctor) [4 pts]
+    # ------------------------------------------------------------------
+
+    def check_phase3_prescribe(self) -> int:
+        self._section("Phase 3 -- prescribe (doctor) [4 pts]")
+        pts = 4
+
+        self._reset_appointments()
+        self._reset_prescriptions()
+        self._run_client_session(
+            [self.patient_name, self.patient_pass],
+            [f"schedule {self.doctor_name} {self.test_time} {self.test_illness}"]
+        )
+
+        c_out, s_outs = self._run_client_session(
+            [self.doctor_name, self.doctor_pass],
+            [f"prescribe {self.patient_name} Daily"]
+        )
+        hosp  = s_outs.get("hospital_server", "")
+        appt  = s_outs.get("appointment_server", "")
+        presc = s_outs.get("prescription_server", "")
+
+        client_ok = contains_any(c_out, ["successfully prescribed", self.test_treatment.lower()])
+        hosp_ok   = contains_any(hosp, ["prescription request", "prescribe"])
+        appt_ok   = contains_any(appt, ["sending back", "successfully removed", self.patient_hs])
+        presc_ok  = contains_any(presc, ["prescription", self.doctor_name, self.patient_hs])
+
+        if client_ok and hosp_ok and appt_ok and presc_ok:
+            earned = pts
+        elif client_ok and hosp_ok and appt_ok:
+            earned = pts - 1
+        elif client_ok and hosp_ok:
+            earned = pts - 2
+        elif client_ok:
+            earned = pts - 2
+        else:
+            earned = 0
+        self._record("prescribe (success)", earned, pts)
+
+        # Deduction: prescribe must free the appointment slot
+        try:
+            with open(self.submission_dir / "appointments.txt") as f:
+                content = f.read()
+            if self.patient_hs in content:
+                self._deduct("prescribe did not free the appointment slot", 1)
+        except Exception:
+            pass
+
+        return earned
+
+    # ------------------------------------------------------------------
+    # Phase 3 -- view_prescription (patient) [6 pts: 2+2+2]
+    # ------------------------------------------------------------------
+
+    def check_phase3_view_prescription_patient(self) -> int:
+        self._section("Phase 3 -- view_prescription (patient) [6 pts]")
         total = 0
 
-        # ---- lookup (list doctors) ----
-        pts = 5
-        out = self._run_client_session(
-            [self.patient_name, self.patient_pass],
-            ["lookup"],
-        )
-        if self.doctor_name in out:
-            self._record("lookup (list all doctors)", pts, pts)
-            total += pts
-        else:
-            self._record("lookup (expected doctor list in response)", 0, pts)
-
-        # ---- lookup <doctor> – all slots free ----
-        pts = 5
-        out = self._run_client_session(
-            [self.patient_name, self.patient_pass],
-            [f"lookup {self.doctor_name}"],
-        )
-        if ("all time blocks are available" in out.lower() or
-                "09:00" in out or "10:00" in out):
-            self._record(f"lookup {self.doctor_name} (availability shown)", pts, pts)
-            total += pts
-        else:
-            self._record(
-                f"lookup {self.doctor_name} (expected availability info)", 0, pts
-            )
-
-        # ---- schedule: successful booking ----
-        pts = 7
-        out = self._run_client_session(
-            [self.patient_name, self.patient_pass],
-            [f"schedule {self.doctor_name} {self.test_time} {self.test_illness}"],
-        )
-        # Reset appointments file so later tests start fresh
+        # Sub-case: active prescription exists (2 pts)
+        pts = 2
         self._reset_appointments()
-        if "successfully" in out.lower() or "scheduled" in out.lower():
-            self._record(
-                f"schedule {self.doctor_name} {self.test_time} {self.test_illness} (success)", pts, pts
-            )
-            total += pts
-        else:
-            self._record(
-                f"schedule (expected success message)", 0, pts
-            )
-
-        # ---- schedule: slot already taken ----
-        pts = 4
-        # Book the slot first, then try again
+        self._reset_prescriptions()
         self._run_client_session(
             [self.patient_name, self.patient_pass],
-            [f"schedule {self.doctor_name} {self.test_time} {self.test_illness}"],
+            [f"schedule {self.doctor_name} {self.test_time} {self.test_illness}"]
         )
-        out = self._run_client_session(
-            [self.patient_name, self.patient_pass],
-            [f"schedule {self.doctor_name} {self.test_time} {self.test_illness}"],
-        )
-        self._reset_appointments()
-        if ("not available" in out.lower() or "unable" in out.lower() or
-                "taken" in out.lower() or "failed" in out.lower()):
-            self._record("schedule (duplicate slot correctly rejected)", pts, pts)
-            total += pts
-        else:
-            self._record("schedule (duplicate slot – expected failure message)", 0, pts)
-
-        # ---- view_appointment ----
-        pts = 4
-        # Book first, then view
         self._run_client_session(
-            [self.patient_name, self.patient_pass],
-            [f"schedule {self.doctor_name} {self.test_time} {self.test_illness}"],
-        )
-        out = self._run_client_session(
-            [self.patient_name, self.patient_pass],
-            ["view_appointment"],
-        )
-        self._reset_appointments()
-        if self.doctor_name in out or self.test_time in out:
-            self._record("view_appointment (appointment details returned)", pts, pts)
-            total += pts
-        else:
-            self._record("view_appointment (expected appointment details)", 0, pts)
-
-        # ---- cancel ----
-        pts = 5
-        # Book, then cancel
-        self._run_client_session(
-            [self.patient_name, self.patient_pass],
-            [f"schedule {self.doctor_name} {self.test_time} {self.test_illness}"],
-        )
-        out = self._run_client_session(
-            [self.patient_name, self.patient_pass],
-            ["cancel"],
-        )
-        self._reset_appointments()
-        if "successfully cancelled" in out.lower() or "cancelled" in out.lower():
-            self._record("cancel (cancellation successful)", pts, pts)
-            total += pts
-        else:
-            self._record("cancel (expected cancellation success message)", 0, pts)
-
-        # ---- Doctor: view_appointments ----
-        pts = 5
-        # Book a patient, then doctor views
-        self._run_client_session(
-            [self.patient_name, self.patient_pass],
-            [f"schedule {self.doctor_name} {self.test_time} {self.test_illness}"],
-        )
-        out = self._run_client_session(
             [self.doctor_name, self.doctor_pass],
-            ["view_appointments"],
+            [f"prescribe {self.patient_name} Daily"]
         )
-        self._reset_appointments()
-        if self.test_time in out or self.patient_hash_suffix in out:
-            self._record("view_appointments (doctor sees booked slot)", pts, pts)
-            total += pts
+        c_out, s_outs = self._run_client_session(
+            [self.patient_name, self.patient_pass], ["view_prescription"]
+        )
+        presc = s_outs.get("prescription_server", "")
+        client_ok = contains_any(c_out, [self.test_treatment.lower(), "prescribed", "daily"])
+        presc_ok  = contains_any(presc, ["prescription exists", "a prescription exists"])
+        if client_ok and presc_ok:
+            earned = pts
+        elif client_ok:
+            earned = pts - 1
         else:
-            self._record("view_appointments (expected scheduled slots in response)", 0, pts)
+            earned = 0
+        self._record("view_prescription (patient) -- prescription exists", earned, pts)
+        total += earned
 
-        return total
-
-    def check_phase3(self) -> int:
-        """Phase 3: prescription commands."""
-        self._section("Phase 3 – Prescription Commands")
-        max_pts = self.WEIGHTS["phase3"]
-        total = 0
-
-        # Book a patient appointment (prerequisite for prescribe)
+        # Sub-case: frequency = None (2 pts)
+        pts = 2
+        self._reset_appointments()
+        self._reset_prescriptions()
         self._run_client_session(
             [self.patient_name, self.patient_pass],
-            [f"schedule {self.doctor_name} {self.test_time} {self.test_illness}"],
+            [f"schedule {self.doctor_name} {self.test_time} {self.test_illness}"]
         )
-
-        # ---- prescribe ----
-        pts = 10
-        out = self._run_client_session(
+        self._run_client_session(
             [self.doctor_name, self.doctor_pass],
-            [f"prescribe {self.patient_name} Daily"],
+            [f"prescribe {self.patient_name} None"]
         )
-        if ("successfully prescribed" in out.lower() or
-                self.test_treatment.lower() in out.lower()):
-            self._record(
-                f"prescribe {self.patient_name} Daily (prescription saved)", pts, pts
-            )
-            total += pts
+        c_out, s_outs = self._run_client_session(
+            [self.patient_name, self.patient_pass], ["view_prescription"]
+        )
+        presc = s_outs.get("prescription_server", "")
+        client_ok = contains_any(c_out, ["were not prescribed", "not prescribed", "none"])
+        presc_ok  = contains_any(presc, ["no current prescriptions", "there are no current"])
+        if client_ok and presc_ok:
+            earned = pts
+        elif client_ok:
+            earned = pts - 1
         else:
-            self._record(
-                f"prescribe (expected success + treatment name in response)", 0, pts
-            )
+            earned = 0
+        self._record("view_prescription (patient) -- frequency is None", earned, pts)
+        total += earned
 
-        # ---- view_prescription (doctor) ----
-        pts = 7
-        out = self._run_client_session(
-            [self.doctor_name, self.doctor_pass],
-            [f"view_prescription {self.patient_name}"],
-        )
-        if (self.test_treatment.lower() in out.lower() or
-                "Daily" in out or "daily" in out.lower()):
-            self._record(
-                f"view_prescription {self.patient_name} (doctor sees prescription)", pts, pts
-            )
-            total += pts
-        else:
-            self._record(
-                f"view_prescription (doctor) – expected treatment/frequency in response", 0, pts
-            )
-
-        # ---- view_prescription (patient) ----
-        pts = 8
-        out = self._run_client_session(
-            [self.patient_name, self.patient_pass],
-            ["view_prescription"],
-        )
+        # Sub-case: no prescription record (2 pts)
+        pts = 2
         self._reset_prescriptions()
         self._reset_appointments()
-        if (self.test_treatment.lower() in out.lower() or
-                self.doctor_name in out or "daily" in out.lower()):
-            self._record(
-                "view_prescription (patient sees their prescription)", pts, pts
-            )
-            total += pts
+        c_out, s_outs = self._run_client_session(
+            [self.patient_name, self.patient_pass], ["view_prescription"]
+        )
+        presc = s_outs.get("prescription_server", "")
+        client_ok = contains_any(c_out, ["do not have a prescription", "no prescription",
+                                         "you do not"])
+        presc_ok  = contains_any(presc, ["no current prescriptions", "there are no current"])
+        if client_ok and presc_ok:
+            earned = pts
+        elif client_ok:
+            earned = pts - 1
         else:
-            self._record(
-                "view_prescription (patient) – expected treatment/doctor in response", 0, pts
-            )
+            earned = 0
+        self._record("view_prescription (patient) -- no prescription record", earned, pts)
+        total += earned
 
         return total
 
     # ------------------------------------------------------------------
-    # Reset helpers (restore data files between test cases)
+    # Phase 3 -- view_prescription (doctor) [4 pts: 2+2]
     # ------------------------------------------------------------------
 
-    def _reset_appointments(self):
-        """Restore appointments.txt to all-empty slots (no patients booked)."""
-        with open(self.submission_dir / "appointments.txt", "w") as f:
-            f.write(f"{self.doctor_name}\n")
-            for hour in range(9, 17):
-                f.write(f"{hour:02d}:00\n")
-        time.sleep(0.3)
+    def check_phase3_view_prescription_doctor(self) -> int:
+        self._section("Phase 3 -- view_prescription <patient> (doctor) [4 pts]")
+        total = 0
 
-    def _reset_prescriptions(self):
-        """Clear prescriptions.txt."""
-        with open(self.submission_dir / "prescriptions.txt", "w") as f:
-            f.write("")
-        time.sleep(0.3)
+        # Sub-case: prescription exists (2 pts)
+        pts = 2
+        self._reset_appointments()
+        self._reset_prescriptions()
+        self._run_client_session(
+            [self.patient_name, self.patient_pass],
+            [f"schedule {self.doctor_name} {self.test_time} {self.test_illness}"]
+        )
+        self._run_client_session(
+            [self.doctor_name, self.doctor_pass],
+            [f"prescribe {self.patient_name} Daily"]
+        )
+        c_out, s_outs = self._run_client_session(
+            [self.doctor_name, self.doctor_pass],
+            [f"view_prescription {self.patient_name}"]
+        )
+        presc = s_outs.get("prescription_server", "")
+        client_ok = contains_any(c_out, [self.test_treatment.lower(), "prescribed", "daily",
+                                         self.patient_name])
+        presc_ok  = contains_any(presc, ["prescription exists", "a prescription exists"])
+        if client_ok and presc_ok:
+            earned = pts
+        elif client_ok:
+            earned = pts - 1
+        else:
+            earned = 0
+        self._record(f"view_prescription {self.patient_name} (doctor) -- exists", earned, pts)
+        total += earned
+
+        # Sub-case: no prescription (2 pts)
+        pts = 2
+        self._reset_prescriptions()
+        self._reset_appointments()
+        c_out, s_outs = self._run_client_session(
+            [self.doctor_name, self.doctor_pass],
+            [f"view_prescription {self.patient_name}"]
+        )
+        presc = s_outs.get("prescription_server", "")
+        client_ok = contains_any(c_out, ["does not have a prescription", "no prescription",
+                                         self.patient_name])
+        presc_ok  = contains_any(presc, ["no current prescriptions", "there are no current"])
+        if client_ok and presc_ok:
+            earned = pts
+        elif client_ok:
+            earned = pts - 1
+        else:
+            earned = 0
+        self._record(f"view_prescription {self.patient_name} (doctor) -- no record", earned, pts)
+        total += earned
+
+        return total
 
     # ------------------------------------------------------------------
-    # Entry point
+    # Deductions -- port number correctness
+    # ------------------------------------------------------------------
+
+    def check_port_deductions(self):
+        self._section("Deductions -- Static Port Numbers")
+        n = int(self.usc_suffix)
+        checks = [
+            ("authentication_server", self.auth_udp_port,  "authentication_server"),
+            ("prescription_server",   self.presc_udp_port, "prescription_server"),
+            ("appointment_server",    self.appt_udp_port,  "appointment_server"),
+            ("hospital_server (UDP)", self.hosp_udp_port,  "hospital_server"),
+            ("hospital_server (TCP)", self.hosp_tcp_port,  "hospital_server"),
+        ]
+        for label, expected_port, reader_key in checks:
+            output = self.readers.get(reader_key, _DummyReader()).all_output()
+            if output and str(expected_port) not in output:
+                self._deduct(f"Wrong port for {label} (expected {expected_port})", 3)
+            else:
+                print(f"  \u2713 Port {expected_port} for {label}: OK")
+
+    # ------------------------------------------------------------------
+    # Main runner
     # ------------------------------------------------------------------
 
     def run(self) -> int:
-        print(f"\n{'#'*60}")
-        print(f"  EE450 Socket Programming Autograder (Spring 2026)")
+        print(f"\n{'#'*62}")
+        print(f"  EE450 Socket Programming Autograder -- Spring 2026")
         print(f"  Submission : {self.submission_dir}")
         print(f"  USC suffix : {self.usc_suffix}")
         print(f"  Ports      : auth={self.auth_udp_port}, appt={self.appt_udp_port},")
         print(f"               presc={self.presc_udp_port}, hosp_udp={self.hosp_udp_port},")
         print(f"               hosp_tcp={self.hosp_tcp_port}")
-        print(f"{'#'*60}\n")
+        print(f"{'#'*62}\n")
 
         try:
-            # --- File & compilation checks ---
             file_pts = self.check_files()
             if file_pts == 0:
-                print("\n  *** Submission missing Makefile or README – CANNOT GRADE ***")
+                print("\n  *** Missing Makefile or README -- SUBMISSION WILL NOT BE GRADED ***")
                 self._print_summary()
-                return self.score
+                return 0
 
             compile_pts = self.check_compile()
             if compile_pts == 0:
-                self.score = 5  # spec: 5/100 for non-compiling code
-                print("\n  *** Compilation failed – grading stops (5/100 per spec) ***")
+                self.score = 5
+                print("\n  *** Compilation failed -- 5/100 cap per spec ***")
                 self._print_summary()
                 return self.score
 
-            # --- Create test data ---
             self._create_test_data()
+            self.check_phase1a()
 
-            # --- Start servers & check boot-up ---
-            p1a_pts = self.check_phase1a()
+            if not self.readers:
+                print("\n  *** No servers could be started -- 10/100 cap per spec ***")
+                self.score = min(self.score, 10)
+                self._print_summary()
+                return self.score
 
-            # --- Run functional tests ---
-            p1b_pts = self.check_phase1b()
-            p2_pts  = self.check_phase2()
-            p3_pts  = self.check_phase3()
+            self.check_phase1b()
+            self.check_phase2_lookup()
+            self.check_phase2_lookup_doctor()
+            self.check_phase2_schedule()
+            self.check_phase2_view_appointment()
+            self.check_phase2_view_appointments_doctor()
+            self.check_phase2_cancel()
+            self.check_phase3_prescribe()
+            self.check_phase3_view_prescription_patient()
+            self.check_phase3_view_prescription_doctor()
+            self.check_port_deductions()
 
         finally:
             self._kill_all()
 
-        self._print_summary()
-        return self.score
+        return self._print_summary()
 
-    def _print_summary(self):
-        print(f"\n{'='*60}")
+    def _print_summary(self) -> int:
+        print(f"\n{'='*62}")
         print("  GRADING SUMMARY")
-        print(f"{'='*60}")
+        print(f"{'='*62}")
         for line in self.feedback:
             print(line)
-        print(f"\n  {'─'*40}")
-        print(f"  TOTAL SCORE: {self.score} / 100")
-        print(f"{'='*60}\n")
+        gross = self.score
+        net   = max(0, gross - self.deductions)
+        print(f"\n  {'--'*23}")
+        print(f"  Gross score  : {gross} / 100")
+        if self.deductions:
+            print(f"  Deductions   : -{self.deductions}")
+        print(f"  FINAL SCORE  : {net} / 100")
+        print(f"{'='*62}\n")
+        return net
 
 
 # ---------------------------------------------------------------------------
-# Main
+# Entry point
 # ---------------------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser(
         description="EE450 Spring 2026 Socket Programming Project Autograder"
     )
-    parser.add_argument(
-        "submission_dir",
-        help="Path to the extracted submission directory",
-    )
-    parser.add_argument(
-        "--usc-id",
-        dest="usc_id",
-        default="000",
-        help="Last 3 digits of student's USC ID (used to derive port numbers). Default: 000",
-    )
-    parser.add_argument(
-        "--verbose", "-v",
-        action="store_true",
-        help="Print debug information including raw process output",
-    )
+    parser.add_argument("submission_dir",
+                        help="Path to the extracted submission directory")
+    parser.add_argument("--usc-id", dest="usc_id", default="000",
+                        help="Last 3 digits of student USC ID (default: 000)")
+    parser.add_argument("--verbose", "-v", action="store_true",
+                        help="Print debug output from all processes")
     args = parser.parse_args()
 
     grader = Grader(
